@@ -676,20 +676,15 @@ impl<F: Field> ConstraintSystem<F> {
                     .await
                     .ok_or(SynthesisError::AssignmentMissing)?;
                 if a * b != c {
-                    let trace;
-                    {
-                        trace = self.constraint_traces[i].as_ref().map_or_else(
-                            || {
-                                eprintln!("Constraint trace requires enabling `ConstraintLayer`");
-                                format!("{}", i)
-                            },
-                            |t| format!("{}", t),
-                        );
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        trace = format!("{}", i);
-                    }
+                    let mut trace;
+                    trace = self.constraint_traces[i].as_ref().map_or_else(
+                        || {
+                            eprintln!("Constraint trace requires enabling `ConstraintLayer`");
+                            format!("{}", i)
+                        },
+                        |t| format!("{}", t),
+                    );
+                    trace = format!("{}", i);
                     return Ok(Some(trace));
                 }
             }
@@ -1058,52 +1053,46 @@ impl<F: Field> ConstraintSystemRef<F> {
 
     /// Get trace information about all constraints in the system
     pub async fn constraint_names(&self) -> Option<Vec<String>> {
-        {
-            let cs = self.inner()?;
-            let guard = cs.lock().await;
-            guard
-                .constraint_traces
-                .iter()
-                .map(|trace| {
-                    let mut constraint_path = String::new();
-                    let mut prev_module_path = "";
-                    let mut prefixes = ark_std::collections::BTreeSet::new();
-                    for step in trace.as_ref()?.path() {
-                        let module_path = if prev_module_path == step.module_path {
-                            prefixes.insert(step.module_path.to_string());
-                            String::new()
-                        } else {
-                            let mut parts = step
-                                .module_path
-                                .split("::")
-                                .filter(|&part| part != "r1cs_std" && part != "constraints");
-                            let mut path_so_far = String::new();
-                            for part in parts.by_ref() {
-                                if path_so_far.is_empty() {
-                                    path_so_far += part;
-                                } else {
-                                    path_so_far += &["::", part].join("");
-                                }
-                                if prefixes.contains(&path_so_far) {
-                                    continue;
-                                } else {
-                                    prefixes.insert(path_so_far.clone());
-                                    break;
-                                }
+        let cs = self.inner()?;
+        let guard = cs.lock().await;
+        guard
+            .constraint_traces
+            .iter()
+            .map(|trace| {
+                let mut constraint_path = String::new();
+                let mut prev_module_path = "";
+                let mut prefixes = ark_std::collections::BTreeSet::new();
+                for step in trace.as_ref()?.path() {
+                    let module_path = if prev_module_path == step.module_path {
+                        prefixes.insert(step.module_path.to_string());
+                        String::new()
+                    } else {
+                        let mut parts = step
+                            .module_path
+                            .split("::")
+                            .filter(|&part| part != "r1cs_std" && part != "constraints");
+                        let mut path_so_far = String::new();
+                        for part in parts.by_ref() {
+                            if path_so_far.is_empty() {
+                                path_so_far += part;
+                            } else {
+                                path_so_far += &["::", part].join("");
                             }
-                            parts.collect::<Vec<_>>().join("::") + "::"
-                        };
-                        prev_module_path = step.module_path;
-                        constraint_path += &["/", &module_path, step.name].join("");
-                    }
-                    Some(constraint_path)
-                })
-                .collect::<Option<Vec<_>>>()
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            None
-        }
+                            if prefixes.contains(&path_so_far) {
+                                continue;
+                            } else {
+                                prefixes.insert(path_so_far.clone());
+                                break;
+                            }
+                        }
+                        parts.collect::<Vec<_>>().join("::") + "::"
+                    };
+                    prev_module_path = step.module_path;
+                    constraint_path += &["/", &module_path, step.name].join("");
+                }
+                Some(constraint_path)
+            })
+            .collect::<Option<Vec<_>>>()
     }
 }
 
