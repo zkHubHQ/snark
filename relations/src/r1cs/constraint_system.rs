@@ -1,4 +1,4 @@
-#[cfg(feature = "std")]
+// #[cfg(feature = "std")]
 use crate::r1cs::ConstraintTrace;
 use crate::r1cs::{LcIndex, LinearCombination, Matrix, SynthesisError, Variable};
 use ark_ff::Field;

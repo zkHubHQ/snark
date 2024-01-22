@@ -2,7 +2,7 @@
 //! zkSNARKs. At the moment, we only implement APIs for working with Rank-1
 //! Constraint Systems (R1CS).
 
-#![cfg_attr(not(feature = "std"), no_std)]
+// #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(
     unused,
     future_incompatible,
