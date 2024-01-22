@@ -11,7 +11,7 @@
 #![forbid(unsafe_code)]
 
 use ark_ff::PrimeField;
-use ark_relations_zkhub::r1cs::ConstraintSynthesizer;
+use ark_relations::r1cs::ConstraintSynthesizer;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::fmt::Debug;
 use ark_std::rand::{CryptoRng, RngCore};
