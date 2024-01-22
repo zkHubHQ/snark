@@ -7,8 +7,8 @@ pub type Result<T> = core::result::Result<T, SynthesisError>;
 
 #[macro_use]
 mod impl_lc;
-// pub mod constraint_system_sync;
-pub mod constraint_system;
+// mod constraint_system_sync;
+mod constraint_system;
 mod error;
 #[cfg(feature = "std")]
 mod trace;
