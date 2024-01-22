@@ -1,4 +1,3 @@
-// #[cfg(feature = "std")]
 use crate::r1cs::ConstraintTrace;
 use crate::r1cs::{LcIndex, LinearCombination, Matrix, SynthesisError, Variable};
 use ark_ff::Field;
@@ -66,7 +65,6 @@ pub struct ConstraintSystem<F: Field> {
 
     lc_map: BTreeMap<LcIndex, LinearCombination<F>>,
 
-    #[cfg(feature = "std")]
     constraint_traces: Vec<Option<ConstraintTrace>>,
 
     a_constraints: Vec<LcIndex>,
@@ -141,7 +139,6 @@ impl<F: Field> ConstraintSystem<F> {
             instance_assignment: vec![F::one()],
             witness_assignment: Vec::new(),
             cache_map: Arc::new(Mutex::new(BTreeMap::new())),
-            #[cfg(feature = "std")]
             constraint_traces: Vec::new(),
 
             lc_map: BTreeMap::new(),
@@ -269,7 +266,6 @@ impl<F: Field> ConstraintSystem<F> {
             self.c_constraints.push(c_index);
         }
         self.num_constraints += 1;
-        #[cfg(feature = "std")]
         {
             let trace = ConstraintTrace::capture();
             self.constraint_traces.push(trace);
@@ -681,7 +677,6 @@ impl<F: Field> ConstraintSystem<F> {
                     .ok_or(SynthesisError::AssignmentMissing)?;
                 if a * b != c {
                     let trace;
-                    #[cfg(feature = "std")]
                     {
                         trace = self.constraint_traces[i].as_ref().map_or_else(
                             || {
@@ -1063,7 +1058,6 @@ impl<F: Field> ConstraintSystemRef<F> {
 
     /// Get trace information about all constraints in the system
     pub async fn constraint_names(&self) -> Option<Vec<String>> {
-        #[cfg(feature = "std")]
         {
             let cs = self.inner()?;
             let guard = cs.lock().await;

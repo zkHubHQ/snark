@@ -10,10 +10,8 @@ mod impl_lc;
 // mod constraint_system_sync;
 mod constraint_system;
 mod error;
-#[cfg(feature = "std")]
 mod trace;
 
-#[cfg(feature = "std")]
 pub use crate::r1cs::trace::{ConstraintLayer, ConstraintTrace, TraceStep, TracingMode};
 
 pub use tracing::info_span;
