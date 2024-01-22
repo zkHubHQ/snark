@@ -7,8 +7,8 @@ pub type Result<T> = core::result::Result<T, SynthesisError>;
 
 #[macro_use]
 mod impl_lc;
+// pub mod constraint_system_sync;
 pub mod constraint_system;
-pub mod constraint_system_async;
 mod error;
 #[cfg(feature = "std")]
 mod trace;
@@ -19,7 +19,7 @@ pub use crate::r1cs::trace::{ConstraintLayer, ConstraintTrace, TraceStep, Tracin
 pub use tracing::info_span;
 
 pub use ark_ff::{Field, ToConstraintField};
-pub use constraint_system_async::{
+pub use constraint_system::{
     ConstraintMatrices, ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, Namespace,
     OptimizationGoal, SynthesisMode,
 };

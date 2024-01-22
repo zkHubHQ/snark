@@ -13,6 +13,9 @@ use ark_std::{
     vec,
     vec::Vec,
 };
+use async_recursion::async_recursion;
+use std::sync::Arc;
+use tokio::sync::{Mutex, MutexGuard};
 
 /// Computations are expressed in terms of rank-1 constraint systems (R1CS).
 /// The `generate_constraints` method is called to generate constraints for
@@ -59,7 +62,7 @@ pub struct ConstraintSystem<F: Field> {
     pub witness_assignment: Vec<F>,
 
     /// Map for gadgets to cache computation results.
-    pub cache_map: Rc<RefCell<BTreeMap<TypeId, Box<dyn Any>>>>,
+    pub cache_map: Arc<Mutex<BTreeMap<TypeId, Box<dyn Any>>>>,
 
     lc_map: BTreeMap<LcIndex, LinearCombination<F>>,
 
@@ -70,7 +73,7 @@ pub struct ConstraintSystem<F: Field> {
     b_constraints: Vec<LcIndex>,
     c_constraints: Vec<LcIndex>,
 
-    lc_assignment_cache: Rc<RefCell<BTreeMap<LcIndex, F>>>,
+    lc_assignment_cache: Arc<Mutex<BTreeMap<LcIndex, F>>>,
 }
 
 impl<F: Field> Default for ConstraintSystem<F> {
@@ -137,12 +140,12 @@ impl<F: Field> ConstraintSystem<F> {
             c_constraints: Vec::new(),
             instance_assignment: vec![F::one()],
             witness_assignment: Vec::new(),
-            cache_map: Rc::new(RefCell::new(BTreeMap::new())),
+            cache_map: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(feature = "std")]
             constraint_traces: Vec::new(),
 
             lc_map: BTreeMap::new(),
-            lc_assignment_cache: Rc::new(RefCell::new(BTreeMap::new())),
+            lc_assignment_cache: Arc::new(Mutex::new(BTreeMap::new())),
 
             mode: SynthesisMode::Prove {
                 construct_matrices: true,
@@ -421,7 +424,7 @@ impl<F: Field> ConstraintSystem<F> {
     /// Useful for SNARKs like [\[Marlin\]](https://eprint.iacr.org/2019/1047) or
     /// [\[Fractal\]](https://eprint.iacr.org/2019/1076), where addition gates
     /// are not cheap.
-    fn outline_lcs(&mut self) {
+    async fn outline_lcs(&mut self) {
         // Only inline when a matrix representing R1CS is needed.
         if !self.should_construct_matrices() {
             return;
@@ -433,24 +436,72 @@ impl<F: Field> ConstraintSystem<F> {
         let mut new_witness_linear_combinations = Vec::new();
         let mut new_witness_indices = Vec::new();
 
-        // It goes through all the LCs in the map, starting from
-        // the early ones, and decides whether or not to dedicate a witness
-        // variable for this LC.
-        //
-        // If true, the LC is replaced with 1 * this witness variable.
-        // Otherwise, the LC is inlined.
-        //
-        // Each iteration first updates the LC according to outlinings in prior
-        // iterations, and then sees if it should be outlined, and if so adds
-        // the outlining to the map.
-        //
-        self.transform_lc_map(&mut |cs, num_times_used, inlined_lc| {
+        // new code here
+
+        // `transformed_lc_map` stores the transformed linear combinations.
+        let mut transformed_lc_map = BTreeMap::<_, LinearCombination<F>>::new();
+        let mut num_times_used = self.lc_num_times_used(false);
+
+        // This loop goes through all the LCs in the map, starting from
+        // the early ones. The transformer function is applied to the
+        // inlined LC, where new witness variables can be created.
+        for (&index, lc) in &self.lc_map {
+            let mut transformed_lc = LinearCombination::new();
+
+            // Inline the LC, unwrapping symbolic LCs that may constitute it,
+            // and updating them according to transformations in prior iterations.
+            for &(coeff, var) in lc.iter() {
+                if var.is_lc() {
+                    let lc_index = var.get_lc_index().expect("should be lc");
+
+                    // If `var` is a `SymbolicLc`, fetch the corresponding
+                    // inlined LC, and substitute it in.
+                    //
+                    // We have the guarantee that `lc_index` must exist in
+                    // `new_lc_map` since a LC can only depend on other
+                    // LCs with lower indices, which we have transformed.
+                    //
+                    let lc = transformed_lc_map
+                        .get(&lc_index)
+                        .expect("should be inlined");
+                    transformed_lc.extend((lc * coeff).0.into_iter());
+
+                    // Delete linear combinations that are no longer used.
+                    //
+                    // Deletion is safe for both outlining and inlining:
+                    // * Inlining: the LC is substituted directly into all use sites, and so once it
+                    //   is fully inlined, it is redundant.
+                    //
+                    // * Outlining: the LC is associated with a new variable `w`, and a new
+                    //   constraint of the form `lc_data * 1 = w`, where `lc_data` is the actual
+                    //   data in the linear combination. Furthermore, we replace its entry in
+                    //   `new_lc_map` with `(1, w)`. Once `w` is fully inlined, then we can delete
+                    //   the entry from `new_lc_map`
+                    //
+                    num_times_used[lc_index.0] -= 1;
+                    if num_times_used[lc_index.0] == 0 {
+                        // This lc is not used any more, so remove it.
+                        transformed_lc_map.remove(&lc_index);
+                    }
+                } else {
+                    // Otherwise, it's a concrete variable and so we
+                    // substitute it in directly.
+                    transformed_lc.push((coeff, var));
+                }
+            }
+            transformed_lc.compactify();
+
+            let num_times_used_val = num_times_used[index.0];
+            let inlined_lc = &mut transformed_lc;
+
+            // start of callback
+
             let mut should_dedicate_a_witness_variable = false;
             let mut new_witness_index = None;
             let mut new_witness_assignment = Vec::new();
 
             // Check if it is worthwhile to dedicate a witness variable.
-            let this_used_times = num_times_used + 1;
+            let this_used_times = num_times_used_val + 1;
             let this_len = inlined_lc.len();
 
             // Cost with no outlining = `lc_len * number of usages`
@@ -465,14 +516,14 @@ impl<F: Field> ConstraintSystem<F> {
             if should_dedicate_a_witness_variable {
                 // Add a new witness (the value of the linear combination).
                 // This part follows the same logic of `new_witness_variable`.
-                let witness_index = cs.num_witness_variables;
+                let witness_index = self.num_witness_variables;
                 new_witness_index = Some(witness_index);
 
                 // Compute the witness assignment.
-                if !cs.is_in_setup_mode() {
+                if !self.is_in_setup_mode() {
                     let mut acc = F::zero();
                     for (coeff, var) in inlined_lc.iter() {
-                        acc += *coeff * &cs.assigned_value(*var).unwrap();
+                        acc += *coeff * &self.assigned_value(*var).await.unwrap();
                     }
                     new_witness_assignment.push(acc);
                 }
@@ -487,12 +538,36 @@ impl<F: Field> ConstraintSystem<F> {
             // Otherwise, the LC remains unchanged.
 
             // Return information about new witness variables.
-            if new_witness_index.is_some() {
-                (1, Some(new_witness_assignment))
-            } else {
-                (0, None)
+            let (num_new_witness_variables, new_witness_assignments) =
+                if new_witness_index.is_some() {
+                    (1, Some(new_witness_assignment))
+                } else {
+                    (0, None)
+                };
+
+            // end of callback
+
+            // Insert the transformed LC.
+            transformed_lc_map.insert(index, transformed_lc);
+
+            // Update the witness counter.
+            self.num_witness_variables += num_new_witness_variables;
+
+            // Supply additional witness assignments if not in the
+            // setup mode and if new witness variables are created.
+            if !self.is_in_setup_mode() && num_new_witness_variables > 0 {
+                assert!(new_witness_assignments.is_some());
+                if let Some(new_witness_assignments) = new_witness_assignments {
+                    assert_eq!(new_witness_assignments.len(), num_new_witness_variables);
+                    self.witness_assignment
+                        .extend_from_slice(&new_witness_assignments);
+                }
             }
-        });
+        }
+        // Replace the LC map.
+        self.lc_map = transformed_lc_map;
+
+        // end of new code
 
         // Add the constraints for the newly added witness variables.
         for (new_witness_linear_combination, new_witness_variable) in
@@ -512,11 +587,11 @@ impl<F: Field> ConstraintSystem<F> {
 
     /// Finalize the constraint system (either by outlining or inlining,
     /// if an optimization goal is set).
-    pub fn finalize(&mut self) {
+    pub async fn finalize(&mut self) {
         match self.optimization_goal {
             OptimizationGoal::None => self.inline_all_lcs(),
             OptimizationGoal::Constraints => self.inline_all_lcs(),
-            OptimizationGoal::Weight => self.outline_lcs(),
+            OptimizationGoal::Weight => self.outline_lcs().await,
         };
     }
 
@@ -566,11 +641,12 @@ impl<F: Field> ConstraintSystem<F> {
         }
     }
 
-    fn eval_lc(&self, lc: LcIndex) -> Option<F> {
+    #[async_recursion(?Send)]
+    async fn eval_lc(&self, lc: LcIndex) -> Option<F> {
         let lc = self.lc_map.get(&lc)?;
         let mut acc = F::zero();
         for (coeff, var) in lc.iter() {
-            acc += *coeff * self.assigned_value(*var)?;
+            acc += *coeff * self.assigned_value(*var).await?;
         }
         Some(acc)
     }
@@ -578,27 +654,30 @@ impl<F: Field> ConstraintSystem<F> {
     /// If `self` is satisfied, outputs `Ok(true)`.
     /// If `self` is unsatisfied, outputs `Ok(false)`.
     /// If `self.is_in_setup_mode()`, outputs `Err(())`.
-    pub fn is_satisfied(&self) -> crate::r1cs::Result<bool> {
-        self.which_is_unsatisfied().map(|s| s.is_none())
+    pub async fn is_satisfied(&self) -> crate::r1cs::Result<bool> {
+        self.which_is_unsatisfied().await.map(|s| s.is_none())
     }
 
     /// If `self` is satisfied, outputs `Ok(None)`.
     /// If `self` is unsatisfied, outputs `Some(i)`, where `i` is the index of
     /// the first unsatisfied constraint. If `self.is_in_setup_mode()`, outputs
     /// `Err(())`.
-    pub fn which_is_unsatisfied(&self) -> crate::r1cs::Result<Option<String>> {
+    pub async fn which_is_unsatisfied(&self) -> crate::r1cs::Result<Option<String>> {
         if self.is_in_setup_mode() {
             Err(SynthesisError::AssignmentMissing)
         } else {
             for i in 0..self.num_constraints {
                 let a = self
                     .eval_lc(self.a_constraints[i])
+                    .await
                     .ok_or(SynthesisError::AssignmentMissing)?;
                 let b = self
                     .eval_lc(self.b_constraints[i])
+                    .await
                     .ok_or(SynthesisError::AssignmentMissing)?;
                 let c = self
                     .eval_lc(self.c_constraints[i])
+                    .await
                     .ok_or(SynthesisError::AssignmentMissing)?;
                 if a * b != c {
                     let trace;
@@ -624,19 +703,20 @@ impl<F: Field> ConstraintSystem<F> {
     }
 
     /// Obtain the assignment corresponding to the `Variable` `v`.
-    pub fn assigned_value(&self, v: Variable) -> Option<F> {
+    pub async fn assigned_value(&self, v: Variable) -> Option<F> {
         match v {
             Variable::One => Some(F::one()),
             Variable::Zero => Some(F::zero()),
             Variable::Witness(idx) => self.witness_assignment.get(idx).copied(),
             Variable::Instance(idx) => self.instance_assignment.get(idx).copied(),
             Variable::SymbolicLc(idx) => {
-                let value = self.lc_assignment_cache.borrow().get(&idx).copied();
+                let mut lc_assignment_cache = self.lc_assignment_cache.lock().await;
+                let value = lc_assignment_cache.get(&idx).copied();
                 if value.is_some() {
                     value
                 } else {
-                    let value = self.eval_lc(idx)?;
-                    self.lc_assignment_cache.borrow_mut().insert(idx, value);
+                    let value = self.eval_lc(idx).await?;
+                    lc_assignment_cache.insert(idx, value);
                     Some(value)
                 }
             },
@@ -684,7 +764,7 @@ pub enum ConstraintSystemRef<F: Field> {
     None,
     /// Represents the case where we *do* allocate variables or enforce
     /// constraints.
-    CS(Rc<RefCell<ConstraintSystem<F>>>),
+    CS(Arc<Mutex<ConstraintSystem<F>>>),
 }
 
 impl<F: Field> PartialEq for ConstraintSystemRef<F> {
@@ -757,10 +837,10 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// Construct a `ConstraintSystemRef` from a `ConstraintSystem`.
     #[inline]
     pub fn new(inner: ConstraintSystem<F>) -> Self {
-        Self::CS(Rc::new(RefCell::new(inner)))
+        Self::CS(Arc::new(Mutex::new(inner)))
     }
 
-    fn inner(&self) -> Option<&Rc<RefCell<ConstraintSystem<F>>>> {
+    fn inner(&self) -> Option<&Arc<Mutex<ConstraintSystem<F>>>> {
         match self {
             Self::CS(a) => Some(a),
             Self::None => None,
@@ -772,7 +852,7 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// `Self::CS` exist.  
     pub fn into_inner(self) -> Option<ConstraintSystem<F>> {
         match self {
-            Self::CS(a) => Rc::try_unwrap(a).ok().map(|s| s.into_inner()),
+            Self::CS(a) => Arc::try_unwrap(a).ok().map(|s| s.into_inner()),
             Self::None => None,
         }
     }
@@ -782,8 +862,12 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// # Panics
     /// This method panics if `self` is already mutably borrowed.
     #[inline]
-    pub fn borrow(&self) -> Option<Ref<'_, ConstraintSystem<F>>> {
-        self.inner().map(|cs| cs.borrow())
+    pub async fn borrow(&self) -> Option<MutexGuard<'_, ConstraintSystem<F>>> {
+        if let Some(cs) = self.inner() {
+            Some(cs.lock().await)
+        } else {
+            None
+        }
     }
 
     /// Obtain a mutable reference to the underlying `ConstraintSystem`.
@@ -791,125 +875,133 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// # Panics
     /// This method panics if `self` is already mutably borrowed.
     #[inline]
-    pub fn borrow_mut(&self) -> Option<RefMut<'_, ConstraintSystem<F>>> {
-        self.inner().map(|cs| cs.borrow_mut())
-    }
-
-    /// Set `self.mode` to `mode`.
-    pub fn set_mode(&self, mode: SynthesisMode) {
-        self.inner().map_or((), |cs| cs.borrow_mut().set_mode(mode))
+    pub async fn borrow_mut(&self) -> Option<MutexGuard<'_, ConstraintSystem<F>>> {
+        if let Some(cs) = self.inner() {
+            Some(cs.lock().await)
+        } else {
+            None
+        }
     }
 
     /// Check whether `self.mode == SynthesisMode::Setup`.
     #[inline]
-    pub fn is_in_setup_mode(&self) -> bool {
-        self.inner()
-            .map_or(false, |cs| cs.borrow().is_in_setup_mode())
+    pub async fn is_in_setup_mode(&self) -> bool {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.is_in_setup_mode()
+        } else {
+            false
+        }
     }
 
     /// Returns the number of constraints.
     #[inline]
-    pub fn num_constraints(&self) -> usize {
-        self.inner().map_or(0, |cs| cs.borrow().num_constraints)
+    pub async fn num_constraints(&self) -> usize {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.num_constraints
+        } else {
+            0
+        }
     }
 
     /// Returns the number of instance variables.
     #[inline]
-    pub fn num_instance_variables(&self) -> usize {
-        self.inner()
-            .map_or(0, |cs| cs.borrow().num_instance_variables)
+    pub async fn num_instance_variables(&self) -> usize {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.num_instance_variables
+        } else {
+            0
+        }
     }
 
     /// Returns the number of witness variables.
     #[inline]
-    pub fn num_witness_variables(&self) -> usize {
-        self.inner()
-            .map_or(0, |cs| cs.borrow().num_witness_variables)
+    pub async fn num_witness_variables(&self) -> usize {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.num_witness_variables
+        } else {
+            0
+        }
     }
 
     /// Check whether this constraint system aims to optimize weight,
     /// number of constraints, or neither.
     #[inline]
-    pub fn optimization_goal(&self) -> OptimizationGoal {
-        self.inner().map_or(OptimizationGoal::Constraints, |cs| {
-            cs.borrow().optimization_goal()
-        })
+    pub async fn optimization_goal(&self) -> OptimizationGoal {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.optimization_goal()
+        } else {
+            OptimizationGoal::Constraints
+        }
     }
 
     /// Specify whether this constraint system should aim to optimize weight,
     /// number of constraints, or neither.
     #[inline]
-    pub fn set_optimization_goal(&self, goal: OptimizationGoal) {
-        self.inner()
-            .map_or((), |cs| cs.borrow_mut().set_optimization_goal(goal))
+    pub async fn set_optimization_goal(&self, goal: OptimizationGoal) {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.set_optimization_goal(goal);
+        }
     }
 
     /// Check whether or not `self` will construct matrices.
     #[inline]
-    pub fn should_construct_matrices(&self) -> bool {
-        self.inner()
-            .map_or(false, |cs| cs.borrow().should_construct_matrices())
+    pub async fn should_construct_matrices(&self) -> bool {
+        if let Some(cs) = self.inner() {
+            cs.lock().await.should_construct_matrices()
+        } else {
+            false
+        }
     }
 
     /// Obtain a variable representing a new public instance input.
     #[inline]
-    pub fn new_input_variable<Func>(&self, f: Func) -> crate::r1cs::Result<Variable>
+    pub async fn new_input_variable<Func>(&self, f: Func) -> crate::r1cs::Result<Variable>
     where
-        Func: FnOnce() -> crate::r1cs::Result<F>,
+        Func: FnOnce() -> crate::r1cs::Result<F> + Send,
     {
-        self.inner()
-            .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| {
-                if !self.is_in_setup_mode() {
-                    // This is needed to avoid double-borrows, because `f`
-                    // might itself mutably borrow `cs` (eg: `f = || g.value()`).
-                    let value = f();
-                    cs.borrow_mut().new_input_variable(|| value)
-                } else {
-                    cs.borrow_mut().new_input_variable(f)
-                }
-            })
+        let cs = self.inner().ok_or(SynthesisError::MissingCS)?;
+
+        if !self.is_in_setup_mode().await {
+            let value = f();
+            cs.lock().await.new_input_variable(|| value)
+        } else {
+            cs.lock().await.new_input_variable(f)
+        }
     }
 
     /// Obtain a variable representing a new private witness input.
     #[inline]
-    pub fn new_witness_variable<Func>(&self, f: Func) -> crate::r1cs::Result<Variable>
+    pub async fn new_witness_variable<Func>(&self, f: Func) -> crate::r1cs::Result<Variable>
     where
-        Func: FnOnce() -> crate::r1cs::Result<F>,
+        Func: FnOnce() -> crate::r1cs::Result<F> + Send,
     {
-        self.inner()
-            .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| {
-                if !self.is_in_setup_mode() {
-                    // This is needed to avoid double-borrows, because `f`
-                    // might itself mutably borrow `cs` (eg: `f = || g.value()`).
-                    let value = f();
-                    cs.borrow_mut().new_witness_variable(|| value)
-                } else {
-                    cs.borrow_mut().new_witness_variable(f)
-                }
-            })
+        let cs = self.inner().ok_or(SynthesisError::MissingCS)?;
+
+        if !self.is_in_setup_mode().await {
+            let value = f();
+            cs.lock().await.new_witness_variable(|| value)
+        } else {
+            cs.lock().await.new_witness_variable(f)
+        }
     }
 
     /// Obtain a variable representing a linear combination.
     #[inline]
-    pub fn new_lc(&self, lc: LinearCombination<F>) -> crate::r1cs::Result<Variable> {
-        self.inner()
-            .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| cs.borrow_mut().new_lc(lc))
+    pub async fn new_lc(&self, lc: LinearCombination<F>) -> crate::r1cs::Result<Variable> {
+        let cs = self.inner().ok_or(SynthesisError::MissingCS)?;
+        cs.lock().await.new_lc(lc)
     }
 
     /// Enforce a R1CS constraint with the name `name`.
     #[inline]
-    pub fn enforce_constraint(
+    pub async fn enforce_constraint(
         &self,
         a: LinearCombination<F>,
         b: LinearCombination<F>,
         c: LinearCombination<F>,
     ) -> crate::r1cs::Result<()> {
-        self.inner()
-            .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| cs.borrow_mut().enforce_constraint(a, b, c))
+        let cs = self.inner().ok_or(SynthesisError::MissingCS)?;
+        cs.lock().await.enforce_constraint(a, b, c)
     }
 
     /// Naively inlines symbolic linear combinations into the linear
@@ -920,17 +1012,17 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// [\[Groth-Maller17\]](https://eprint.iacr.org/2017/540), addition gates
     /// do not contribute to the size of the multi-scalar multiplication, which
     /// is the dominating cost.
-    pub fn inline_all_lcs(&self) {
+    pub async fn inline_all_lcs(&self) {
         if let Some(cs) = self.inner() {
-            cs.borrow_mut().inline_all_lcs()
+            cs.lock().await.inline_all_lcs()
         }
     }
 
     /// Finalize the constraint system (either by outlining or inlining,
     /// if an optimization goal is set).
-    pub fn finalize(&self) {
+    pub async fn finalize(&self) {
         if let Some(cs) = self.inner() {
-            cs.borrow_mut().finalize()
+            cs.lock().await.finalize().await
         }
     }
 
@@ -938,80 +1030,81 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// after all symbolic LCs have been inlined into the places that they
     /// are used.
     #[inline]
-    pub fn to_matrices(&self) -> Option<ConstraintMatrices<F>> {
-        self.inner().and_then(|cs| cs.borrow().to_matrices())
+    pub async fn to_matrices(&self) -> Option<ConstraintMatrices<F>> {
+        if let Some(cs) = self.inner() {
+            Some(cs.lock().await.to_matrices()?)
+        } else {
+            None
+        }
     }
 
     /// If `self` is satisfied, outputs `Ok(true)`.
     /// If `self` is unsatisfied, outputs `Ok(false)`.
     /// If `self.is_in_setup_mode()` or if `self == None`, outputs `Err(())`.
-    pub fn is_satisfied(&self) -> crate::r1cs::Result<bool> {
-        self.inner()
-            .map_or(Err(SynthesisError::AssignmentMissing), |cs| {
-                cs.borrow().is_satisfied()
-            })
+    pub async fn is_satisfied(&self) -> crate::r1cs::Result<bool> {
+        let cs = self.inner().ok_or(SynthesisError::AssignmentMissing)?;
+        cs.lock().await.is_satisfied().await
     }
 
     /// If `self` is satisfied, outputs `Ok(None)`.
     /// If `self` is unsatisfied, outputs `Some(i)`, where `i` is the index of
     /// the first unsatisfied constraint.
     /// If `self.is_in_setup_mode()` or `self == None`, outputs `Err(())`.
-    pub fn which_is_unsatisfied(&self) -> crate::r1cs::Result<Option<String>> {
-        self.inner()
-            .map_or(Err(SynthesisError::AssignmentMissing), |cs| {
-                cs.borrow().which_is_unsatisfied()
-            })
+    pub async fn which_is_unsatisfied(&self) -> crate::r1cs::Result<Option<String>> {
+        let cs = self.inner().ok_or(SynthesisError::AssignmentMissing)?;
+        cs.lock().await.which_is_unsatisfied().await
     }
 
     /// Obtain the assignment corresponding to the `Variable` `v`.
-    pub fn assigned_value(&self, v: Variable) -> Option<F> {
-        self.inner().and_then(|cs| cs.borrow().assigned_value(v))
+    pub async fn assigned_value(&self, v: Variable) -> Option<F> {
+        let cs = self.inner()?;
+        cs.lock().await.assigned_value(v).await
     }
 
     /// Get trace information about all constraints in the system
-    pub fn constraint_names(&self) -> Option<Vec<String>> {
+    pub async fn constraint_names(&self) -> Option<Vec<String>> {
         #[cfg(feature = "std")]
         {
-            self.inner().and_then(|cs| {
-                cs.borrow()
-                    .constraint_traces
-                    .iter()
-                    .map(|trace| {
-                        let mut constraint_path = String::new();
-                        let mut prev_module_path = "";
-                        let mut prefixes = ark_std::collections::BTreeSet::new();
-                        for step in trace.as_ref()?.path() {
-                            let module_path = if prev_module_path == step.module_path {
-                                prefixes.insert(step.module_path.to_string());
-                                String::new()
-                            } else {
-                                let mut parts = step
-                                    .module_path
-                                    .split("::")
-                                    .filter(|&part| part != "r1cs_std" && part != "constraints");
-                                let mut path_so_far = String::new();
-                                for part in parts.by_ref() {
-                                    if path_so_far.is_empty() {
-                                        path_so_far += part;
-                                    } else {
-                                        path_so_far += &["::", part].join("");
-                                    }
-                                    if prefixes.contains(&path_so_far) {
-                                        continue;
-                                    } else {
-                                        prefixes.insert(path_so_far.clone());
-                                        break;
-                                    }
+            let cs = self.inner()?;
+            let guard = cs.lock().await;
+            guard
+                .constraint_traces
+                .iter()
+                .map(|trace| {
+                    let mut constraint_path = String::new();
+                    let mut prev_module_path = "";
+                    let mut prefixes = ark_std::collections::BTreeSet::new();
+                    for step in trace.as_ref()?.path() {
+                        let module_path = if prev_module_path == step.module_path {
+                            prefixes.insert(step.module_path.to_string());
+                            String::new()
+                        } else {
+                            let mut parts = step
+                                .module_path
+                                .split("::")
+                                .filter(|&part| part != "r1cs_std" && part != "constraints");
+                            let mut path_so_far = String::new();
+                            for part in parts.by_ref() {
+                                if path_so_far.is_empty() {
+                                    path_so_far += part;
+                                } else {
+                                    path_so_far += &["::", part].join("");
                                 }
-                                parts.collect::<Vec<_>>().join("::") + "::"
-                            };
-                            prev_module_path = step.module_path;
-                            constraint_path += &["/", &module_path, step.name].join("");
-                        }
-                        Some(constraint_path)
-                    })
-                    .collect::<Option<Vec<_>>>()
-            })
+                                if prefixes.contains(&path_so_far) {
+                                    continue;
+                                } else {
+                                    prefixes.insert(path_so_far.clone());
+                                    break;
+                                }
+                            }
+                            parts.collect::<Vec<_>>().join("::") + "::"
+                        };
+                        prev_module_path = step.module_path;
+                        constraint_path += &["/", &module_path, step.name].join("");
+                    }
+                    Some(constraint_path)
+                })
+                .collect::<Option<Vec<_>>>()
         }
         #[cfg(not(feature = "std"))]
         {
@@ -1022,26 +1115,28 @@ impl<F: Field> ConstraintSystemRef<F> {
 
 #[cfg(test)]
 mod tests {
-    use crate::r1cs::constraint_system::ConstraintSystem;
-    use crate::r1cs::constraint_system::OptimizationGoal;
-    use crate::r1cs::Variable;
+    use crate::r1cs::*;
+
     use ark_ff::One;
     use ark_test_curves::bls12_381::Fr;
 
-    #[test]
-    fn matrix_generation() -> crate::r1cs::Result<()> {
+    #[tokio::test]
+    async fn matrix_generation() -> crate::r1cs::Result<()> {
         let cs = ConstraintSystem::<Fr>::new_ref();
         let two = Fr::one() + Fr::one();
-        let a = cs.new_input_variable(|| Ok(Fr::one()))?;
-        let b = cs.new_witness_variable(|| Ok(Fr::one()))?;
-        let c = cs.new_witness_variable(|| Ok(two))?;
-        cs.enforce_constraint(lc!() + a, lc!() + (two, b), lc!() + c)?;
-        let d = cs.new_lc(lc!() + a + b)?;
-        cs.enforce_constraint(lc!() + a, lc!() + d, lc!() + d)?;
-        let e = cs.new_lc(lc!() + d + d)?;
-        cs.enforce_constraint(lc!() + Variable::One, lc!() + e, lc!() + e)?;
-        cs.inline_all_lcs();
-        let matrices = cs.to_matrices().unwrap();
+        let a = cs.new_input_variable(|| Ok(Fr::one())).await?;
+        let b = cs.new_witness_variable(|| Ok(Fr::one())).await?;
+        let c = cs.new_witness_variable(|| Ok(two)).await?;
+        cs.enforce_constraint(lc!() + a, lc!() + (two, b), lc!() + c)
+            .await?;
+        let d = cs.new_lc(lc!() + a + b).await?;
+        cs.enforce_constraint(lc!() + a, lc!() + d, lc!() + d)
+            .await?;
+        let e = cs.new_lc(lc!() + d + d).await?;
+        cs.enforce_constraint(lc!() + Variable::One, lc!() + e, lc!() + e)
+            .await?;
+        cs.inline_all_lcs().await;
+        let matrices = cs.to_matrices().await.unwrap();
         assert_eq!(matrices.a[0], vec![(Fr::one(), 1)]);
         assert_eq!(matrices.b[0], vec![(two, 2)]);
         assert_eq!(matrices.c[0], vec![(Fr::one(), 3)]);
@@ -1056,25 +1151,28 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn matrix_generation_outlined() -> crate::r1cs::Result<()> {
+    #[tokio::test]
+    async fn matrix_generation_outlined() -> crate::r1cs::Result<()> {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        cs.set_optimization_goal(OptimizationGoal::Weight);
+        cs.set_optimization_goal(OptimizationGoal::Weight).await;
         let two = Fr::one() + Fr::one();
-        let a = cs.new_input_variable(|| Ok(Fr::one()))?;
-        let b = cs.new_witness_variable(|| Ok(Fr::one()))?;
-        let c = cs.new_witness_variable(|| Ok(two))?;
-        cs.enforce_constraint(lc!() + a, lc!() + (two, b), lc!() + c)?;
+        let a = cs.new_input_variable(|| Ok(Fr::one())).await?;
+        let b = cs.new_witness_variable(|| Ok(Fr::one())).await?;
+        let c = cs.new_witness_variable(|| Ok(two)).await?;
+        cs.enforce_constraint(lc!() + a, lc!() + (two, b), lc!() + c)
+            .await?;
 
-        let d = cs.new_lc(lc!() + a + b)?;
-        cs.enforce_constraint(lc!() + a, lc!() + d, lc!() + d)?;
+        let d = cs.new_lc(lc!() + a + b).await?;
+        cs.enforce_constraint(lc!() + a, lc!() + d, lc!() + d)
+            .await?;
 
-        let e = cs.new_lc(lc!() + d + d)?;
-        cs.enforce_constraint(lc!() + Variable::One, lc!() + e, lc!() + e)?;
+        let e = cs.new_lc(lc!() + d + d).await?;
+        cs.enforce_constraint(lc!() + Variable::One, lc!() + e, lc!() + e)
+            .await?;
 
-        cs.finalize();
-        assert!(cs.is_satisfied().unwrap());
-        let matrices = cs.to_matrices().unwrap();
+        cs.finalize().await;
+        assert!(cs.is_satisfied().await.unwrap());
+        let matrices = cs.to_matrices().await.unwrap();
         assert_eq!(matrices.a[0], vec![(Fr::one(), 1)]);
         assert_eq!(matrices.b[0], vec![(two, 2)]);
         assert_eq!(matrices.c[0], vec![(Fr::one(), 3)]);
@@ -1095,8 +1193,8 @@ mod tests {
     /// Example meant to follow as closely as possible the excellent R1CS
     /// write-up by [Vitalik Buterin](https://vitalik.ca/general/2016/12/10/qap.html)
     /// and demonstrate how to construct such matrices in arkworks.
-    #[test]
-    fn matrix_generation_example() -> crate::r1cs::Result<()> {
+    #[tokio::test]
+    async fn matrix_generation_example() -> crate::r1cs::Result<()> {
         let cs = ConstraintSystem::<Fr>::new_ref();
         // helper definitions
         let three = Fr::from(3u8);
@@ -1115,24 +1213,30 @@ mod tests {
         // Variable::Witness(30) ( == sym_2 )
 
         // let one = Variable::One; // public input, implicitly defined
-        let out = cs.new_input_variable(|| Ok(nine * three + three + five))?; // public input
-        let x = cs.new_witness_variable(|| Ok(three))?; // explicit witness
-        let sym_1 = cs.new_witness_variable(|| Ok(nine))?; // intermediate witness variable
-        let y = cs.new_witness_variable(|| Ok(nine * three))?; // intermediate witness variable
-        let sym_2 = cs.new_witness_variable(|| Ok(nine * three + three))?; // intermediate witness variable
+        let out = cs
+            .new_input_variable(|| Ok(nine * three + three + five))
+            .await?; // public input
+        let x = cs.new_witness_variable(|| Ok(three)).await?; // explicit witness
+        let sym_1 = cs.new_witness_variable(|| Ok(nine)).await?; // intermediate witness variable
+        let y = cs.new_witness_variable(|| Ok(nine * three)).await?; // intermediate witness variable
+        let sym_2 = cs.new_witness_variable(|| Ok(nine * three + three)).await?; // intermediate witness variable
 
-        cs.enforce_constraint(lc!() + x, lc!() + x, lc!() + sym_1)?;
-        cs.enforce_constraint(lc!() + sym_1, lc!() + x, lc!() + y)?;
-        cs.enforce_constraint(lc!() + y + x, lc!() + Variable::One, lc!() + sym_2)?;
+        cs.enforce_constraint(lc!() + x, lc!() + x, lc!() + sym_1)
+            .await?;
+        cs.enforce_constraint(lc!() + sym_1, lc!() + x, lc!() + y)
+            .await?;
+        cs.enforce_constraint(lc!() + y + x, lc!() + Variable::One, lc!() + sym_2)
+            .await?;
         cs.enforce_constraint(
             lc!() + sym_2 + (five, Variable::One),
             lc!() + Variable::One,
             lc!() + out,
-        )?;
+        )
+        .await?;
 
-        cs.finalize();
-        assert!(cs.is_satisfied().unwrap());
-        let matrices = cs.to_matrices().unwrap();
+        cs.finalize().await;
+        assert!(cs.is_satisfied().await.unwrap());
+        let matrices = cs.to_matrices().await.unwrap();
         // There are four gates(constraints), each generating a row.
         // Resulting matrices:
         // (Note how 2nd & 3rd columns are swapped compared to the online example.
