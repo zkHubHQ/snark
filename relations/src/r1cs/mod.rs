@@ -7,8 +7,8 @@ pub type Result<T> = core::result::Result<T, SynthesisError>;
 
 #[macro_use]
 mod impl_lc;
-// mod constraint_system_sync;
 mod constraint_system;
+mod constraint_system_async;
 mod error;
 mod trace;
 
@@ -20,6 +20,10 @@ pub use ark_ff::{Field, ToConstraintField};
 pub use constraint_system::{
     ConstraintMatrices, ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, Namespace,
     OptimizationGoal, SynthesisMode,
+};
+pub use constraint_system_async::{
+    ConstraintMatrices as ConstraintMatricesAsync,
+    ConstraintSynthesizer as ConstraintSynthesizerAsync,
 };
 pub use error::SynthesisError;
 
