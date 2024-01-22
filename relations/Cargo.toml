@@ -1,6 +1,6 @@
 [package]
 name = "ark-relations-zkhub"
-version = "0.4.6"
+version = "0.4.7"
 authors = [ "arkworks contributors" ]
 description = "A library for rank-one constraint systems"
 homepage = "https://arkworks.rs"
@@ -25,4 +25,4 @@ ark-test-curves = { version = "0.4.0", default-features = false, features = [ "b
 
 [features]
 default = ["std"]
-std = [ "ark-std/std", "ark-ff/std", "tracing-subscriber", "tracing/std" ]
+std = [ "ark-std/std", "ark-ff/std", "tracing/std" ]
