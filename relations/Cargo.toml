@@ -1,6 +1,6 @@
 [package]
 name = "ark-relations-zkhub"
-version = "0.4.1"
+version = "0.4.2"
 authors = [ "arkworks contributors" ]
 description = "A library for rank-one constraint systems"
 homepage = "https://arkworks.rs"
