@@ -23,7 +23,9 @@ pub use constraint_system::{
 };
 pub use constraint_system_async::{
     ConstraintMatrices as ConstraintMatricesAsync,
-    ConstraintSynthesizer as ConstraintSynthesizerAsync,
+    ConstraintSynthesizer as ConstraintSynthesizerAsync, ConstraintSystem as ConstraintSystemAsync,
+    ConstraintSystemRef as ConstraintSystemRefAsync, Namespace as NamespaceAsync,
+    OptimizationGoal as OptimizationGoalAsync,
 };
 pub use error::SynthesisError;
 
