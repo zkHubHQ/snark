@@ -59,6 +59,8 @@ pub struct ConstraintSystem<F: Field> {
     pub witness_assignment: Vec<F>,
 
     /// Map for gadgets to cache computation results.
+    #[cfg(feature = "enable_cache")]
+
     pub cache_map: Arc<Mutex<BTreeMap<TypeId, Box<dyn Any>>>>,
 
     lc_map: BTreeMap<LcIndex, LinearCombination<F>>,
@@ -136,6 +138,8 @@ impl<F: Field> ConstraintSystem<F> {
             c_constraints: Vec::new(),
             instance_assignment: vec![F::one()],
             witness_assignment: Vec::new(),
+            #[cfg(feature = "enable_cache")]
+
             cache_map: Arc::new(Mutex::new(BTreeMap::new())),
             constraint_traces: Vec::new(),
 
