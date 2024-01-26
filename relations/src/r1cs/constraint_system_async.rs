@@ -11,8 +11,6 @@ use ark_std::{
     vec::Vec,
 };
 use async_recursion::async_recursion;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -22,10 +20,7 @@ use tokio::sync::{Mutex, MutexGuard};
 // TODO: Think: should we replace this with just a closure?
 pub trait ConstraintSynthesizer<F: Field> {
     /// Drives generation of new constraints inside `cs`.
-    fn generate_constraints(
-        self,
-        cs: ConstraintSystemRef<F>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SynthesisError>> + Send>>;
+    async fn generate_constraints(self, cs: ConstraintSystemRef<F>) -> crate::r1cs::Result<()>;
 }
 
 /// An Rank-One `ConstraintSystem`. Enforces constraints of the form
